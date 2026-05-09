@@ -858,14 +858,16 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(data)
 
     def _send_bytes(self, payload: bytes, content_type: str, code: int = 200):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(payload)
 
     def _cookie_value(self, name: str):
         raw = self.headers.get("Cookie", "")
@@ -921,6 +923,13 @@ class AppHandler(BaseHTTPRequestHandler):
         for k, v in parsed.items():
             result[k] = (v[0] if v else "").strip()
         return result
+
+    def do_HEAD(self):
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
