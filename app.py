@@ -17,6 +17,7 @@ import html
 import hashlib
 import imaplib
 import json
+import base64
 import os
 import re
 import secrets
@@ -815,14 +816,37 @@ def html_to_text(raw_html: str) -> str:
     return text.strip()
 
 
+def inline_cid_images(html_body: str, cid_images: dict[str, str]) -> str:
+    if not html_body or not cid_images:
+        return html_body
+
+    def replace(match: re.Match) -> str:
+        quote = match.group(1) or ""
+        cid = urllib.parse.unquote(match.group(2)).strip("<>").lower()
+        replacement = cid_images.get(cid)
+        if not replacement:
+            return match.group(0)
+        return replacement
+
+    return re.sub(r"cid:(['\"]?)([^'\"\s>)]+)\1", replace, html_body, flags=re.I)
+
+
 def extract_body_parts(msg) -> tuple[str, str]:
     plain_parts: list[str] = []
     html_parts: list[str] = []
+    cid_images: dict[str, str] = {}
     if msg.is_multipart():
         for part in msg.walk():
-            if part.get_content_disposition() == "attachment":
-                continue
+            disposition = part.get_content_disposition()
             ctype = part.get_content_type()
+            content_id = (part.get("Content-ID") or "").strip().strip("<>").lower()
+            if content_id and ctype.startswith("image/"):
+                raw_image = part.get_payload(decode=True)
+                if raw_image:
+                    cid_images[content_id] = f"data:{ctype};base64,{base64.b64encode(raw_image).decode('ascii')}"
+                continue
+            if disposition == "attachment":
+                continue
             if ctype not in ("text/plain", "text/html"):
                 continue
             raw = part.get_payload(decode=True)
@@ -842,6 +866,7 @@ def extract_body_parts(msg) -> tuple[str, str]:
 
     plain = "\n\n".join(p.strip() for p in plain_parts if p and p.strip()).strip()
     html_body = "\n\n".join(p for p in html_parts if p).strip()
+    html_body = inline_cid_images(html_body, cid_images)
     text_body = plain or (html_to_text(html_body) if html_body else "")
     return text_body, html_body
 
