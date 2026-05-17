@@ -1394,7 +1394,7 @@ def sms_form_html(
     <style>
       .wrap{{max-width:none;margin:0;padding:16px}}
       body{{background:#f5f7fb;color:#141c2f;font-family:Arial,"Microsoft YaHei",sans-serif}}
-      .sms-lite{{display:grid;grid-template-columns:300px minmax(640px,44vw) minmax(420px,1fr);gap:14px;align-items:start}}
+      .sms-lite{{display:grid;grid-template-columns:300px minmax(660px,44vw) minmax(440px,1fr);gap:14px;align-items:start}}
       .account-panel,.mail-panel,.preview-panel{{background:#fff;border:1px solid #dde3ee;border-radius:10px;padding:18px;box-shadow:0 12px 34px rgba(20,28,47,.06)}}
       .account-panel{{position:sticky;top:12px}}
       .account-panel h1,.mail-panel h2,.preview-panel h2,.realtime-panel h2{{font-size:20px;line-height:1.25;margin:0 0 8px;font-weight:800;color:#101828}}
@@ -1423,7 +1423,7 @@ def sms_form_html(
       .section-head h2{{margin-bottom:4px}}
       .count-badge{{display:inline-flex;align-items:center;justify-content:center;min-width:54px;height:30px;padding:0 10px;border-radius:999px;background:#eef5ff;color:#1769e0;font-size:13px;font-weight:800;white-space:nowrap}}
       .mail-list{{overflow:auto;max-height:calc(100vh - 104px);border:1px solid #e4e7eb;border-radius:8px;background:#fff}}
-      .mail-table{{table-layout:fixed;margin:0}}
+      .mail-table{{table-layout:fixed;margin:0;min-width:760px}}
       .mail-table th,.mail-table td{{font-size:13px;line-height:1.45;padding:10px;border-color:#e7ecf3;overflow:hidden;text-overflow:ellipsis}}
       .mail-table th{{position:sticky;top:0;z-index:1;background:#f7f9fc;color:#344054;font-weight:800;white-space:nowrap}}
       .mail-table td{{height:72px;color:#1f2937;vertical-align:middle}}
@@ -1440,8 +1440,9 @@ def sms_form_html(
       .preview-head{{border-bottom:1px solid #eef2f7;margin-bottom:12px;padding-bottom:12px}}
       .preview-head h2{{margin-bottom:6px}}
       #mailFrame{{box-sizing:border-box;width:100%;height:calc(100vh - 150px);min-height:560px;border:1px solid #dfe5ef;border-radius:8px;background:#fff}}
-      @media(max-width:1320px){{.sms-lite{{grid-template-columns:300px minmax(620px,1fr)}}.preview-panel{{grid-column:1 / -1;position:static}}#mailFrame{{height:680px}}}}
-      @media(max-width:760px){{.wrap{{padding:8px}}.sms-lite{{grid-template-columns:1fr}}.account-panel,.preview-panel{{position:static}}.mail-list{{max-height:none}}#mailFrame{{height:520px}}}}
+      @media(max-width:1560px){{.sms-lite{{grid-template-columns:300px minmax(0,1fr)}}.preview-panel{{grid-column:1 / -1;position:static}}.mail-list{{max-height:520px}}#mailFrame{{height:680px}}}}
+      @media(max-width:980px){{.sms-lite{{grid-template-columns:1fr}}.account-panel,.preview-panel{{position:static}}.mail-list{{max-height:520px}}}}
+      @media(max-width:760px){{.wrap{{padding:8px}}.account-panel,.mail-panel,.preview-panel{{padding:14px}}.mail-list{{max-height:none}}#mailFrame{{height:520px;min-height:420px}}}}
     </style>
 
     <script>
