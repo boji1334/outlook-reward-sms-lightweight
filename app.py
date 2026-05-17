@@ -1463,6 +1463,7 @@ def sms_form_html(
       const codeResult = document.querySelector('#codeResult');
       let lastAccountLine = '';
       let lastFolder = 'INBOX';
+      let lastRows = [];
       let activeLoads = 0;
 
       function escapeHtml(value) {{
@@ -1495,6 +1496,20 @@ def sms_form_html(
       function setCodeResult(message, type = '') {{
         codeResult.innerHTML = message;
         codeResult.className = `code-result ${{type}}`.trim();
+      }}
+
+      function renderCodeResult(code, subject, ageText, label) {{
+        setCodeResult(
+          `${{escapeHtml(label)}}<span class="code-big">${{escapeHtml(code)}}</span><span class="small">${{escapeHtml(ageText || '')}} ${{escapeHtml(subject || '')}}</span>`,
+          'ok'
+        );
+      }}
+
+      function showCodeFromRows(fallbackMessage = '') {{
+        const row = lastRows.find((item) => item && item.code);
+        if (!row) return false;
+        renderCodeResult(row.code, row.subject || '', fallbackMessage || '来自邮件列表', '邮件验证码');
+        return true;
       }}
 
       async function postForm(path, data) {{
@@ -1535,6 +1550,7 @@ def sms_form_html(
       }}
 
       function renderRows(rows) {{
+        lastRows = rows || [];
         mailCount.textContent = `${{rows.length}} 封`;
         if (!rows.length) {{
           resultRows.innerHTML = '<tr><td colspan="5" class="small">没有读取到邮件。</td></tr>';
@@ -1551,6 +1567,9 @@ def sms_form_html(
             </tr>
           `;
         }}).join('');
+        if (!codeResult.classList.contains('ok')) {{
+          showCodeFromRows('来自邮件列表，可能超过实时窗口');
+        }}
       }}
 
       async function fetchMail() {{
@@ -1620,7 +1639,7 @@ def sms_form_html(
         try {{
           const data = await postJson('/api/v1/code', {{
             account_line: value,
-            provider: 'openai',
+            provider: 'any',
             within_seconds: Number(withinSeconds.value || 30),
             top: Number(topCount.value || 20),
           }});
@@ -1628,10 +1647,14 @@ def sms_form_html(
             const age = Number.isFinite(Number(data.age_seconds)) ? `${{data.age_seconds}} 秒前` : '';
             setCodeResult(`最新验证码<span class="code-big">${{escapeHtml(data.code)}}</span><span class="small">${{escapeHtml(age)}} ${{escapeHtml(data.subject || '')}}</span>`, 'ok');
           }} else {{
-            setCodeResult(escapeHtml(data.message || '未找到验证码。'), 'err');
+            if (!showCodeFromRows('来自邮件列表，可能超过实时窗口')) {{
+              setCodeResult(escapeHtml(data.message || '未找到验证码。'), 'err');
+            }}
           }}
         }} catch (error) {{
-          setCodeResult(escapeHtml(error.message || '读取失败。'), 'err');
+          if (!showCodeFromRows('来自邮件列表，实时接口未命中')) {{
+            setCodeResult(escapeHtml(error.message || '读取失败。'), 'err');
+          }}
         }} finally {{
           setLoading(false, '');
         }}
@@ -1653,6 +1676,7 @@ def sms_form_html(
       }});
       clearButton.addEventListener('click', () => {{
         accountLine.value = '';
+        lastRows = [];
         resultRows.innerHTML = '<tr><td colspan="5" class="small">还没有读取结果。</td></tr>';
         mailCount.textContent = '0 封';
         clearPreview();
