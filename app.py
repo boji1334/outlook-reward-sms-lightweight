@@ -26,9 +26,11 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
@@ -39,6 +41,7 @@ from typing import Iterable
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+ACCOUNT_STORE_PATH = DATA_DIR / "account_store.json"
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "2020"))
@@ -53,6 +56,21 @@ SESSIONS: dict[str, int] = {}
 TOKEN_CACHE: dict[str, tuple[str, int, str]] = {}
 TOKEN_CACHE_TTL = 900
 TOKEN_CACHE_MAX = 64
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+SMS_FETCH_TIMEOUT = env_int("SMS_FETCH_TIMEOUT", 12, 5, 60)
+SMS_VIEW_TIMEOUT = env_int("SMS_VIEW_TIMEOUT", 15, 5, 60)
+SMS_MAX_FOLDER_TRIES = env_int("SMS_MAX_FOLDER_TRIES", 4, 1, 10)
+SMS_CODE_SNIPPET_BYTES = env_int("SMS_CODE_SNIPPET_BYTES", 8192, 1024, 65536)
+SMS_CODE_FALLBACK_LIMIT = env_int("SMS_CODE_FALLBACK_LIMIT", 3, 0, 10)
 
 ALLOWED_EXT = {
     "image/png": ".png",
@@ -85,6 +103,7 @@ class MailRow:
     date: str
     sender: str
     subject: str
+    code: str = ""
 
 
 @dataclass
@@ -203,10 +222,187 @@ def remove_slot_images(slot: int) -> None:
 
 
 # -----------------------------
+# Stored account helpers
+# -----------------------------
+def mask_secret(value: str, keep: int = 6) -> str:
+    value = (value or "").strip()
+    if not value:
+        return "-"
+    if len(value) <= keep:
+        return "*" * len(value)
+    return "***" + value[-keep:]
+
+
+def normalize_account_record(record: dict[str, str]) -> dict[str, str] | None:
+    account_line = str(record.get("account_line", "")).strip()
+    if not account_line:
+        return None
+    try:
+        account = parse_account_line(account_line)
+        account_line = "----".join([account.email, account.password, account.client_id, account.token])
+        email = account.email
+        client_id = account.client_id
+        token_tail = account.token[-10:]
+    except Exception:
+        email = str(record.get("email", "")).strip()
+        client_id = str(record.get("client_id", "")).strip()
+        token_tail = str(record.get("token_tail", "")).strip()
+    return {
+        "account_line": account_line,
+        "email": email,
+        "client_id": client_id,
+        "token_tail": token_tail,
+        "updated_at": str(record.get("updated_at", "")).strip(),
+    }
+
+
+def load_account_records() -> list[dict[str, str]]:
+    try:
+        data = json.loads(ACCOUNT_STORE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    raw_records = data if isinstance(data, list) else data.get("accounts", []) if isinstance(data, dict) else []
+    if isinstance(data, dict) and data.get("account_line"):
+        raw_records = [data]
+
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_records:
+        if not isinstance(item, dict):
+            continue
+        record = normalize_account_record({str(k): str(v) for k, v in item.items()})
+        if not record:
+            continue
+        account_line = record["account_line"]
+        if account_line in seen:
+            continue
+        seen.add(account_line)
+        records.append(record)
+    return records
+
+
+def write_account_records(records: list[dict[str, str]]) -> None:
+    ACCOUNT_STORE_PATH.write_text(
+        json.dumps({"accounts": records}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def save_account_record(account_line: str) -> None:
+    account = parse_account_line(account_line)
+    clean_line = "----".join([account.email, account.password, account.client_id, account.token])
+    record = {
+        "account_line": clean_line,
+        "email": account.email,
+        "client_id": account.client_id,
+        "token_tail": account.token[-10:],
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+    try:
+        records = [x for x in load_account_records() if x.get("account_line") != clean_line]
+        records.append(record)
+        write_account_records(records)
+    except Exception:
+        pass
+
+
+def add_account_lines(raw: str) -> tuple[int, list[str]]:
+    added = 0
+    errors: list[str] = []
+    records = load_account_records()
+    existing = {x.get("account_line", "") for x in records}
+
+    for line_no, line in iter_account_blocks(raw):
+        try:
+            account = parse_account_line(line)
+        except Exception as exc:
+            errors.append(f"第 {line_no} 行: {exc}")
+            continue
+        clean_line = "----".join([account.email, account.password, account.client_id, account.token])
+        if clean_line in existing:
+            continue
+        records.append(
+            {
+                "account_line": clean_line,
+                "email": account.email,
+                "client_id": account.client_id,
+                "token_tail": account.token[-10:],
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            }
+        )
+        existing.add(clean_line)
+        added += 1
+
+    if added:
+        write_account_records(records)
+    return added, errors
+
+
+# -----------------------------
 # Outlook token + fetch helpers
 # -----------------------------
+ACCOUNT_DELIMITER_RE = re.compile(r"\s*(?:-\s*){4}\s*")
+ACCOUNT_START_RE = re.compile(r"^\s*\S+@\S+\.\S+")
+ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+DASH_TRANSLATION = str.maketrans(
+    {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\ufe63": "-",
+        "\uff0d": "-",
+    }
+)
+
+
+def normalize_account_text(raw: str) -> str:
+    text = str(raw or "").translate(DASH_TRANSLATION)
+    text = ZERO_WIDTH_RE.sub("", text)
+    return text.replace("\u00a0", " ").strip()
+
+
+def split_account_fields(raw: str) -> list[str]:
+    text = normalize_account_text(raw)
+    parts = [p.strip() for p in ACCOUNT_DELIMITER_RE.split(text, maxsplit=3)]
+    if len(parts) >= 4:
+        return parts
+
+    # Fallback for copy/paste that turns the four fields into separate lines.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) >= 4 and "@" in lines[0]:
+        return [lines[0], lines[1], lines[2], "".join(lines[3:])]
+
+    return parts
+
+
+def iter_account_blocks(raw: str) -> Iterable[tuple[int, str]]:
+    lines = [
+        (line_no, line.strip())
+        for line_no, line in enumerate(normalize_account_text(raw).splitlines(), start=1)
+        if line.strip()
+    ]
+    if not lines:
+        return
+
+    start_line, current = lines[0][0], [lines[0][1]]
+    for line_no, line in lines[1:]:
+        if current and ACCOUNT_START_RE.match(line):
+            yield start_line, "\n".join(current)
+            start_line, current = line_no, [line]
+        else:
+            current.append(line)
+
+    if current:
+        yield start_line, "\n".join(current)
+
+
 def parse_account_line(raw: str) -> AccountPayload:
-    parts = [p.strip() for p in raw.strip().split("----")]
+    parts = split_account_fields(raw)
     if len(parts) < 4:
         raise ValueError("账号信息格式错误，应为: email----password----client_id----token")
     email, password, client_id, token = parts[0], parts[1], parts[2], parts[3]
@@ -323,6 +519,7 @@ def token_candidates(
         return
 
     # auto
+    refresh_style = raw.startswith("M.C")
     direct_first = looks_like_access_token(raw)
     if direct_first:
         item = put("direct", raw)
@@ -335,7 +532,7 @@ def token_candidates(
             if item:
                 yield item
 
-    if not direct_first:
+    if not direct_first and not refresh_style:
         item = put("direct", raw)
         if item:
             yield item
@@ -360,6 +557,126 @@ def token_candidates_fast(
         yield key
 
 
+def selected_mail_count(select_data) -> int:
+    if not select_data:
+        return 0
+    head = select_data[0]
+    if isinstance(head, (bytes, bytearray)):
+        raw = head.decode("utf-8", errors="ignore")
+    else:
+        raw = str(head or "")
+    m = re.search(r"\d+", raw)
+    if not m:
+        return 0
+    try:
+        return int(m.group(0))
+    except Exception:
+        return 0
+
+
+def extract_seq_from_fetch_meta(meta) -> str:
+    if isinstance(meta, (bytes, bytearray)):
+        raw = bytes(meta).decode("utf-8", errors="ignore")
+    else:
+        raw = str(meta or "")
+    m = re.match(r"\s*(\d+)", raw)
+    return m.group(1) if m else ""
+
+
+def is_auth_or_token_error(err: str) -> bool:
+    t = err.lower()
+    markers = (
+        "authenticate failed",
+        "authentication failed",
+        "invalid credentials",
+        "login failed",
+        "invalid_grant",
+        "xoauth2",
+        "a1 no authenticate",
+        "access denied",
+        "unauthorized",
+    )
+    return any(x in t for x in markers)
+
+
+def is_network_error(err: str) -> bool:
+    t = err.lower()
+    markers = (
+        "timed out",
+        "timeout",
+        "temporary failure",
+        "connection reset",
+        "network is unreachable",
+        "name or service not known",
+        "ssl",
+        "eof",
+        "broken pipe",
+    )
+    return any(x in t for x in markers)
+
+
+def fetch_meta_kind(meta) -> str:
+    if isinstance(meta, (bytes, bytearray)):
+        raw = bytes(meta).decode("utf-8", errors="ignore")
+    else:
+        raw = str(meta or "")
+    up = raw.upper()
+    if "HEADER.FIELDS" in up:
+        return "header"
+    if "BODY[TEXT]" in up or "BODY.PEEK[TEXT]" in up or "TEXT]<" in up:
+        return "text"
+    return ""
+
+
+def normalize_snippet_text(raw: bytes) -> str:
+    text = decode_payload(raw, None)
+    if "<" in text and ">" in text:
+        text = html_to_text(text)
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def extract_verification_code(subject: str, snippet: str) -> str:
+    s = subject or ""
+    b = snippet or ""
+    sources = [s, b, s + "\n" + b]
+
+    key_patterns = (
+        r"(?is)(?:验证码|临时验证码|verification code|otp|openai\s*代码|code)\D{0,40}(?<!\d)(\d{6})(?!\d)",
+        r"(?is)(?<!\d)(\d{6})(?!\d)\D{0,20}(?:验证码|verification code|otp|code)",
+    )
+    for src in sources:
+        for pattern in key_patterns:
+            m = re.search(pattern, src)
+            if m:
+                return m.group(1)
+
+    for src in (s, b):
+        all_codes = re.findall(r"(?<!\d)(\d{6})(?!\d)", src)
+        if all_codes:
+            return all_codes[0]
+    return ""
+
+
+def likely_code_mail(subject: str, sender: str) -> bool:
+    text = f"{subject} {sender}".lower()
+    hints = (
+        "code",
+        "otp",
+        "verification",
+        "verify",
+        "login",
+        "sign in",
+        "openai",
+        "chatgpt",
+        "\u9a8c\u8bc1\u7801",
+        "\u4e34\u65f6",
+        "\u767b\u5f55",
+    )
+    return any(h in text for h in hints)
+
+
 def fetch_imap_headers(
     email_addr: str, access_token: str, folder: str, top: int, timeout: int, host: str, port: int
 ) -> list[MailRow]:
@@ -370,38 +687,96 @@ def fetch_imap_headers(
         xoauth2 = build_xoauth2_bytes(email_addr, access_token)
         mail.authenticate("XOAUTH2", lambda _: xoauth2)
 
-        typ, _ = mail.select(folder, readonly=True)
+        typ, select_data = mail.select(folder, readonly=True)
         if typ != "OK":
             raise RuntimeError(f"无法选择文件夹: {folder}")
 
-        typ, data = mail.search(None, "ALL")
-        if typ != "OK" or not data or not data[0]:
+        total = selected_mail_count(select_data)
+        if total <= 0:
             return []
 
-        ids = data[0].split()
-        target = ids[-top:] if top > 0 else ids
+        fetch_count = top if top > 0 else total
+        start = max(1, total - fetch_count + 1)
+        seq_set = f"{start}:{total}"
+        typ, msg_data = mail.fetch(
+            seq_set,
+            f"(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] BODY.PEEK[TEXT]<0.{SMS_CODE_SNIPPET_BYTES}>)",
+        )
+        if typ != "OK" or not msg_data:
+            return []
+
+        grouped: dict[str, dict[str, bytes]] = {}
+        for part in msg_data:
+            if not (isinstance(part, tuple) and len(part) >= 2):
+                continue
+            seq = extract_seq_from_fetch_meta(part[0])
+            if not seq:
+                continue
+            kind = fetch_meta_kind(part[0])
+            if not kind:
+                continue
+            payload = part[1]
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+            raw = bytes(payload)
+            if not raw:
+                continue
+
+            entry = grouped.setdefault(seq, {"header": b"", "text": b""})
+            if kind == "header":
+                entry["header"] = raw
+            elif kind == "text":
+                entry["text"] += raw
 
         rows: list[MailRow] = []
-        for msg_id in reversed(target):
-            typ, msg_data = mail.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
-            if typ != "OK" or not msg_data:
-                continue
-            header_bytes = b""
-            for part in msg_data:
-                if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
-                    header_bytes = bytes(part[1])
-                    break
+        for seq in sorted(grouped.keys(), key=lambda x: int(x), reverse=True):
+            header_bytes = grouped[seq].get("header", b"")
+            text_bytes = grouped[seq].get("text", b"")
             if not header_bytes:
                 continue
             msg = BytesParser(policy=policy.default).parsebytes(header_bytes)
+            subject = decode_mime_header(str(msg.get("Subject", "")).strip())
+            snippet = normalize_snippet_text(text_bytes) if text_bytes else ""
+            code = extract_verification_code(subject, snippet)
             rows.append(
                 MailRow(
-                    msg_id=msg_id.decode("ascii", errors="ignore"),
+                    msg_id=seq,
                     date=decode_mime_header(str(msg.get("Date", "")).strip()),
                     sender=decode_mime_header(str(msg.get("From", "")).strip()),
-                    subject=decode_mime_header(str(msg.get("Subject", "")).strip()),
+                    subject=subject,
+                    code=code,
                 )
             )
+        rows = [x for x in rows if (x.msg_id or x.date or x.sender or x.subject)]
+        if fetch_count > 0:
+            rows = rows[:fetch_count]
+
+        fallback_used = 0
+        for row in rows:
+            if row.code:
+                continue
+            if fallback_used >= SMS_CODE_FALLBACK_LIMIT:
+                break
+            if not likely_code_mail(row.subject, row.sender):
+                continue
+            try:
+                typ, full_data = mail.fetch(row.msg_id.encode("ascii", errors="ignore"), "(BODY.PEEK[])")
+                if typ != "OK" or not full_data:
+                    continue
+                raw_bytes = b""
+                for part in full_data:
+                    if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
+                        raw_bytes = bytes(part[1])
+                        break
+                if not raw_bytes:
+                    continue
+                full_msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+                body_text = extract_body_text(full_msg)
+                row.code = extract_verification_code(row.subject, body_text)
+                fallback_used += 1
+            except Exception:
+                continue
+
         return rows
     finally:
         try:
@@ -550,6 +925,9 @@ def perform_sms_fetch(
     account = parse_account_line(account_line)
     attempts: list[str] = []
     last_err: str | None = None
+    folders = folder_candidates(folder)[:SMS_MAX_FOLDER_TRIES]
+    if not folders:
+        folders = ["INBOX"]
 
     for source, token in token_candidates_fast(
         account=account,
@@ -559,7 +937,7 @@ def perform_sms_fetch(
         timeout=timeout,
     ):
         folder_ok_empty = False
-        for folder_name in folder_candidates(folder):
+        for folder_name in folders:
             try:
                 rows = fetch_imap_headers(
                     email_addr=account.email,
@@ -590,10 +968,13 @@ def perform_sms_fetch(
                 attempts.append(f"{source}/{folder_name}: failed ({exc})")
                 if source.startswith("cache_"):
                     TOKEN_CACHE.pop(token_cache_key(account), None)
+                if is_auth_or_token_error(last_err) or is_network_error(last_err):
+                    # No need to retry other folders with the same bad token/network state.
+                    break
 
         # Token worked but common folders have no messages.
         if folder_ok_empty:
-            preferred = folder_candidates(folder)[0]
+            preferred = folders[0]
             return SmsFetchResult(
                 account=account.email,
                 token_source=source,
@@ -614,11 +995,14 @@ def perform_sms_view(
     account_line: str,
     msg_id: str,
     preferred_folder: str = "INBOX",
-    timeout: int = 20,
+    timeout: int = SMS_VIEW_TIMEOUT,
 ) -> SmsDetailResult:
     account = parse_account_line(account_line)
     attempts: list[str] = []
     last_err: str | None = None
+    folders = folder_candidates(preferred_folder)[:SMS_MAX_FOLDER_TRIES]
+    if not folders:
+        folders = ["INBOX"]
 
     for source, token in token_candidates_fast(
         account=account,
@@ -627,7 +1011,7 @@ def perform_sms_view(
         tenant="consumers",
         timeout=timeout,
     ):
-        for folder_name in folder_candidates(preferred_folder):
+        for folder_name in folders:
             try:
                 detail = fetch_imap_message_detail(
                     email_addr=account.email,
@@ -659,10 +1043,143 @@ def perform_sms_view(
                 attempts.append(f"{source}/{folder_name}: failed ({exc})")
                 if source.startswith("cache_"):
                     TOKEN_CACHE.pop(token_cache_key(account), None)
+                if is_auth_or_token_error(last_err) or is_network_error(last_err):
+                    break
 
     if not attempts:
         raise RuntimeError("没有可用 token 候选")
     raise RuntimeError("读取邮件内容失败: " + (last_err or "unknown error"))
+
+
+def mail_date_ts(value: str) -> float | None:
+    try:
+        dt = parsedate_to_datetime(value or "")
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def mail_row_within(row: MailRow, seconds: int) -> bool:
+    if seconds <= 0:
+        return True
+    ts = mail_date_ts(row.date)
+    if ts is None:
+        return False
+    age = time.time() - ts
+    return -5 <= age <= seconds
+
+
+def provider_matches(row: MailRow, provider: str) -> bool:
+    provider = (provider or "any").strip().lower()
+    if provider in ("", "any", "all", "*"):
+        return True
+    text = f"{row.subject} {row.sender}".lower()
+    aliases = {
+        "openai": ("openai", "chatgpt"),
+        "chatgpt": ("openai", "chatgpt"),
+        "microsoft": ("microsoft", "outlook", "live.com"),
+    }.get(provider, (provider,))
+    return any(alias in text for alias in aliases)
+
+
+def row_age_seconds(row: MailRow) -> int | None:
+    ts = mail_date_ts(row.date)
+    if ts is None:
+        return None
+    return max(0, int(time.time() - ts))
+
+
+def row_received_iso(row: MailRow) -> str:
+    ts = mail_date_ts(row.date)
+    if ts is None:
+        return ""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def latest_code_response(result: SmsFetchResult, recent_seconds: int = 0, provider: str = "any") -> dict:
+    code_row = next(
+        (
+            row
+            for row in result.rows
+            if row.code and mail_row_within(row, recent_seconds) and provider_matches(row, provider)
+        ),
+        None,
+    )
+    latest_row = next(
+        (
+            row
+            for row in result.rows
+            if mail_row_within(row, recent_seconds) and provider_matches(row, provider)
+        ),
+        None,
+    )
+    if latest_row is None:
+        latest_row = result.rows[0] if result.rows else None
+    picked = code_row or latest_row
+    return {
+        "ok": True,
+        "account": result.account,
+        "code": code_row.code if code_row else "",
+        "found": bool(code_row),
+        "recent_seconds": recent_seconds,
+        "provider": provider or "any",
+        "age_seconds": row_age_seconds(picked) if picked else None,
+        "received_at": row_received_iso(picked) if picked else "",
+        "msg_id": picked.msg_id if picked else "",
+        "date": picked.date if picked else "",
+        "sender": picked.sender if picked else "",
+        "subject": picked.subject if picked else "",
+        "token_source": result.token_source,
+        "server": result.server,
+        "used_folder": result.used_folder,
+        "top": result.top,
+        "attempts": result.attempts,
+    }
+
+
+def api_code_response(result: SmsFetchResult, recent_seconds: int, provider: str) -> dict:
+    payload = latest_code_response(result, recent_seconds=recent_seconds, provider=provider)
+    if not payload.get("found"):
+        return {
+            "ok": False,
+            "reason": "not_found",
+            "message": f"{recent_seconds}秒内未找到验证码" if recent_seconds > 0 else "未找到验证码",
+            "provider": provider or "any",
+            "email": result.account,
+            "recent_seconds": recent_seconds,
+            "checked": len(result.rows),
+            "latest_subject": payload.get("subject") or "",
+            "latest_date": payload.get("date") or "",
+        }
+    return {
+        "ok": True,
+        "code": payload["code"],
+        "provider": provider or "any",
+        "email": result.account,
+        "received_at": payload.get("received_at") or "",
+        "age_seconds": payload.get("age_seconds"),
+        "subject": payload.get("subject") or "",
+        "sender": payload.get("sender") or "",
+        "msg_id": payload.get("msg_id") or "",
+        "recent_seconds": recent_seconds,
+    }
+
+
+def latest_code_text(payload: dict) -> str:
+    if not payload.get("ok"):
+        return "NO|读取失败"
+    code = str(payload.get("code") or "").strip()
+    if not code:
+        recent_seconds = int(payload.get("recent_seconds") or 0)
+        if recent_seconds > 0:
+            return f"NO|{recent_seconds}秒内未找到验证码"
+        return "NO|未找到验证码"
+    subject = str(payload.get("subject") or "").lower()
+    sender = str(payload.get("sender") or "").lower()
+    service = "OpenAI" if ("openai" in subject or "openai" in sender) else "邮箱"
+    return f"YES|您的 {service} 验证代码是: {code}"
 
 
 # -----------------------------
@@ -676,7 +1193,6 @@ def render_layout(title: str, body_html: str) -> str:
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{html.escape(title)}</title>
   <style>
-    *{{font-family:"Times New Roman", Times, serif}}
     body{{margin:0;background:#f4f6f8;color:#111}}
     .wrap{{max-width:1100px;margin:20px auto;padding:0 16px}}
     .card{{background:#fff;border:1px solid #ddd;border-radius:10px;padding:16px;margin-bottom:14px}}
@@ -694,12 +1210,14 @@ def render_layout(title: str, body_html: str) -> str:
     .note{{color:#555;font-size:13px}}
     .ok{{color:#198754}}
     .err{{color:#dc3545}}
-    .mono{{font-family:"Times New Roman", Times, serif}}
+    .mono{{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}}
     table{{width:100%;border-collapse:collapse;margin-top:10px}}
     th,td{{border:1px solid #ddd;padding:8px;font-size:14px;vertical-align:top}}
     th{{background:#f0f2f4}}
     .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}}
     .small{{font-size:12px;color:#666}}
+    .account-table th:first-child,.account-table td:first-child{{width:110px;text-align:center}}
+    .account-line{{box-sizing:border-box;min-height:76px;font-size:12px;line-height:1.45;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}}
   </style>
 </head>
 <body>
@@ -708,40 +1226,220 @@ def render_layout(title: str, body_html: str) -> str:
 </html>"""
 
 
+def stored_account_table_html(search: str = "") -> str:
+    search = (search or "").strip()
+    records = load_account_records()
+    row_html = ""
+
+    for record in records:
+        account_line = record.get("account_line", "").strip()
+        searchable = " ".join(
+            [
+                account_line,
+                record.get("email", ""),
+                record.get("client_id", ""),
+                record.get("token_tail", ""),
+                record.get("updated_at", ""),
+            ]
+        ).lower()
+        if account_line and (not search or search.lower() in searchable):
+            row_html += f"""
+            <tr>
+              <td>
+                <form method="post" action="/sms/fetch" target="_blank">
+                  <input type="hidden" name="account_line" value="{html.escape(account_line)}">
+                  <input type="hidden" name="top" value="20">
+                  <button class="btn" type="submit">接码</button>
+                </form>
+              </td>
+              <td>
+                <textarea class="account-line" readonly onclick="this.select()">{html.escape(account_line)}</textarea>
+              </td>
+            </tr>
+            """
+
+    if not row_html:
+        message = "没有匹配的账号信息" if search else "暂无存储账号信息"
+        row_html = f'<tr><td colspan="2" class="small">{message}</td></tr>'
+
+    return f"""
+    <div class="card">
+      <h3 style="margin-top:0">存储账号信息</h3>
+      <form method="post" action="/admin/accounts/add" style="margin-bottom:12px">
+        <textarea name="account_lines" placeholder="粘贴账号信息，一行一个：email----password----client_id----token" required></textarea>
+        <div class="row" style="margin-top:10px">
+          <button class="btn green" type="submit">添加账号</button>
+        </div>
+      </form>
+      <form method="get" action="/admin" class="row" style="margin-bottom:10px">
+        <input type="text" name="account_q" placeholder="搜索账号信息" value="{html.escape(search)}">
+        <button class="btn" type="submit">搜索</button>
+        <a class="btn gray" href="/admin">清空</a>
+      </form>
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th>接码</th>
+            <th>账号信息</th>
+          </tr>
+        </thead>
+        <tbody>{row_html}</tbody>
+      </table>
+    </div>
+    """
+
+
 def sms_form_html(
     account_line: str = "",
     top: str = "20",
 ) -> str:
     return f"""
     <div class="card">
-      <h1>接码（Outlook 轻量版）</h1>
+      <h1>\u8f7b\u91cf Outlook \u90ae\u7bb1\u67e5\u770b</h1>
       <form method="post" action="/sms/fetch">
-        <label>账号信息（email----password----client_id----token）</label>
-        <textarea name="account_line" placeholder="粘贴完整账号行" required>{html.escape(account_line)}</textarea>
+        <label>\u8d26\u53f7\u884c\uff08email----password----client_id----token\uff09</label>
+        <textarea name="account_line" placeholder="\u7c98\u8d34\u5b8c\u6574\u8d26\u53f7\u884c" required>{html.escape(account_line)}</textarea>
         <div class="grid" style="margin-top:10px;max-width:280px">
-          <label>读取数量
+          <label>\u8bfb\u53d6\u6570\u91cf
             <input type="number" name="top" min="1" max="200" value="{html.escape(top)}">
           </label>
         </div>
         <div class="row" style="margin-top:10px">
-          <button class="btn" type="submit">连接并读取</button>
-          <a class="btn gray" href="/">返回首页</a>
+          <button class="btn" type="submit">\u5f00\u59cb\u8bfb\u53d6</button>
+          <a class="btn gray" href="/">\u8fd4\u56de\u9996\u9875</a>
         </div>
       </form>
-      <p class="note">轻量模式：固定读取 INBOX，自动处理 token，仅读取邮件列表（日期/发件人/主题）。</p>
+      <p class="note">\u9ed8\u8ba4\u4f18\u5148\u8bfb\u53d6 INBOX\uff0c\u5e76\u81ea\u52a8\u5c1d\u8bd5 token \u5019\u9009\uff08\u7f13\u5b58/\u539f\u59cb/\u5237\u65b0\uff09\u3002</p>
     </div>
+    <div class="card">
+      <h3 style="margin-top:0">\u5f00\u6e90\u9879\u76ee</h3>
+      <p class="small" style="font-size:14px;color:#444;line-height:1.8">
+        \u6e90\u7801\u6765\u81ea\uff1a
+        <a href="https://github.com/boji1334/outlook-reward-sms-lightweight" target="_blank" rel="noopener noreferrer">
+          https://github.com/boji1334/outlook-reward-sms-lightweight
+        </a>
+      </p>
+      <p class="small" style="font-size:14px;color:#444;line-height:1.8">
+        \u5982\u679c\u8fd9\u4e2a\u5de5\u5177\u5bf9\u4f60\u6709\u5e2e\u52a9\uff0c\u6b22\u8fce\u5728 GitHub \u70b9\u4e2a Star \u5e76\u5173\u6ce8\uff0c\u652f\u6301\u9879\u76ee\u6301\u7eed\u66f4\u65b0\u3002
+      </p>
+    </div>
+    """
+
+
+def code_page_html() -> str:
+    return """
+    <div class="card" style="max-width:760px;margin:32px auto">
+      <h1>验证码读取</h1>
+      <form id="codeForm">
+        <label>账号信息</label>
+        <textarea id="accountLine" name="account_line" placeholder="email----password----client_id----refresh_token" required></textarea>
+        <div class="grid" style="margin-top:10px">
+          <label>平台
+            <select id="provider" name="provider">
+              <option value="openai" selected>OpenAI</option>
+              <option value="any">不限</option>
+            </select>
+          </label>
+          <label>时间窗口
+            <input id="withinSeconds" type="number" name="within_seconds" min="1" max="300" value="30">
+          </label>
+          <label>读取数量
+            <input id="top" type="number" name="top" min="1" max="200" value="20">
+          </label>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button id="codeButton" class="btn green" type="submit">获取验证码</button>
+          <button id="clearButton" class="btn gray" type="button">清空</button>
+        </div>
+      </form>
+      <div id="codeResult" class="code-result" aria-live="polite">等待输入账号信息</div>
+    </div>
+    <style>
+      .code-result{margin-top:16px;border:1px solid #ddd;border-radius:8px;padding:16px;background:#fbfcff;min-height:74px;font-size:16px;line-height:1.6}
+      .code-result.ok{border-color:#b7e4c7;background:#f2fbf6;color:#11623a}
+      .code-result.err{border-color:#f2b8b5;background:#fff6f5;color:#b42318}
+      .code-big{display:block;font-size:34px;font-weight:800;line-height:1.25;letter-spacing:0;margin-top:4px;color:#111}
+      @media (max-width:640px){.code-big{font-size:28px}.card{margin-top:12px!important}}
+    </style>
+    <script>
+      const form = document.querySelector('#codeForm');
+      const accountLine = document.querySelector('#accountLine');
+      const provider = document.querySelector('#provider');
+      const withinSeconds = document.querySelector('#withinSeconds');
+      const topInput = document.querySelector('#top');
+      const button = document.querySelector('#codeButton');
+      const clearButton = document.querySelector('#clearButton');
+      const result = document.querySelector('#codeResult');
+
+      function setResult(text, kind) {
+        result.className = 'code-result' + (kind ? ' ' + kind : '');
+        result.innerHTML = text;
+      }
+
+      function escapeHtml(value) {
+        return String(value || '').replace(/[&<>"']/g, ch => ({
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+      }
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const raw = accountLine.value.trim();
+        if (!raw) {
+          setResult('请先粘贴账号信息', 'err');
+          return;
+        }
+        button.disabled = true;
+        setResult('正在读取最新邮件...', '');
+        try {
+          const response = await fetch('/api/v1/code', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              account_line: raw,
+              provider: provider.value,
+              within_seconds: Number(withinSeconds.value || 30),
+              top: Number(topInput.value || 20)
+            })
+          });
+          const data = await response.json();
+          if (data.ok) {
+            const age = Number.isFinite(Number(data.age_seconds)) ? `${data.age_seconds} 秒前` : '';
+            setResult(
+              `${escapeHtml(data.provider || '验证码')} 验证码<span class="code-big">${escapeHtml(data.code)}</span>` +
+              `<span class="small">${escapeHtml(age)} ${escapeHtml(data.subject || '')}</span>`,
+              'ok'
+            );
+          } else {
+            setResult(escapeHtml(data.message || '未找到验证码'), 'err');
+          }
+        } catch (error) {
+          setResult('请求失败，请稍后重试', 'err');
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      clearButton.addEventListener('click', () => {
+        accountLine.value = '';
+        setResult('等待输入账号信息', '');
+        accountLine.focus();
+      });
+    </script>
     """
 
 
 def sms_result_html(result: SmsFetchResult) -> str:
     rows_html = ""
     for i, row in enumerate(result.rows, start=1):
+        code_cell = html.escape(row.code) if row.code else "-"
         rows_html += (
             "<tr>"
             f"<td>{i}</td>"
             f"<td>{html.escape(row.date)}</td>"
             f"<td>{html.escape(row.sender)}</td>"
             f"<td>{html.escape(row.subject)}</td>"
+            f"<td><b>{code_cell}</b></td>"
             "<td>"
             f"<form method=\"post\" action=\"/sms/view\">"
             f"<input type=\"hidden\" name=\"account_line\" value=\"{html.escape(result.raw_line)}\">"
@@ -754,7 +1452,7 @@ def sms_result_html(result: SmsFetchResult) -> str:
             "</tr>"
         )
     if not rows_html:
-        rows_html = '<tr><td colspan="5" class="small">没有读取到邮件</td></tr>'
+        rows_html = '<tr><td colspan="6" class="small">没有读取到邮件</td></tr>'
 
     attempts_html = "<br>".join(html.escape(x) for x in result.attempts)
     return f"""
@@ -771,7 +1469,7 @@ def sms_result_html(result: SmsFetchResult) -> str:
         <button class="btn" type="submit">刷新最新邮件</button>
       </form>
       <table>
-        <thead><tr><th style="width:60px">编号</th><th style="width:250px">日期</th><th>发件人</th><th>主题</th><th style="width:130px">操作</th></tr></thead>
+        <thead><tr><th style="width:60px">编号</th><th style="width:250px">日期</th><th>发件人</th><th>主题</th><th style="width:100px">验证码</th><th style="width:130px">操作</th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
@@ -861,6 +1559,30 @@ class AppHandler(BaseHTTPRequestHandler):
         if not getattr(self, "_head_only", False):
             self.wfile.write(data)
 
+    def _send_json(self, payload: dict, code: int = 200):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(data)
+
+    def _send_text(self, text: str, code: int = 200):
+        data = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(data)
+
     def _send_bytes(self, payload: bytes, content_type: str, code: int = 200):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
@@ -918,11 +1640,27 @@ class AppHandler(BaseHTTPRequestHandler):
     def _parse_urlencoded(self) -> dict[str, str]:
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length).decode("utf-8", "ignore")
+        ctype = (self.headers.get("Content-Type", "") or "").lower()
+        if "application/json" in ctype:
+            try:
+                data = json.loads(raw or "{}")
+                if isinstance(data, dict):
+                    return {str(k): str(v).strip() for k, v in data.items() if v is not None}
+            except Exception:
+                return {}
         parsed = urllib.parse.parse_qs(raw)
         result: dict[str, str] = {}
         for k, v in parsed.items():
             result[k] = (v[0] if v else "").strip()
         return result
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def do_HEAD(self):
         self._head_only = True
@@ -931,10 +1669,115 @@ class AppHandler(BaseHTTPRequestHandler):
         finally:
             self._head_only = False
 
+    def _send_latest_code_result(self, fields: dict[str, str], wants_text: bool = False, relay_text: bool = False):
+        account_line = fields.get("account_line") or fields.get("account") or ""
+        top = fields.get("top", "20")
+        try:
+            top_i = int(top)
+        except Exception:
+            top_i = 20
+        top_i = min(max(top_i, 1), 200)
+        recent_raw = fields.get("recent_seconds") or fields.get("within_seconds") or fields.get("within")
+        if recent_raw is None and relay_text:
+            recent_raw = "30"
+        try:
+            recent_seconds = int(recent_raw or "0")
+        except Exception:
+            recent_seconds = 0
+        recent_seconds = min(max(recent_seconds, 0), 3600)
+        provider = fields.get("provider") or "any"
+
+        try:
+            result = perform_sms_fetch(
+                account_line=account_line,
+                top=top_i,
+                folder=fields.get("folder") or "INBOX",
+                token_kind=fields.get("token_kind") or "auto",
+                refresh_endpoint=fields.get("refresh_endpoint") or "auto",
+                tenant=fields.get("tenant") or "consumers",
+                timeout=SMS_FETCH_TIMEOUT,
+            )
+            payload = latest_code_response(result, recent_seconds=recent_seconds, provider=provider)
+            if relay_text:
+                self._send_text(latest_code_text(payload))
+            elif wants_text:
+                self._send_text(str(payload.get("code") or ""))
+            else:
+                self._send_json(payload)
+        except Exception as exc:
+            if relay_text:
+                self._send_text(f"NO|{exc}", code=400)
+            elif wants_text:
+                self._send_text(str(exc), code=400)
+            else:
+                self._send_json({"ok": False, "error": str(exc)}, code=400)
+
+    def _send_api_v1_code_result(self, fields: dict[str, str]):
+        account_line = fields.get("account_line") or fields.get("account") or ""
+        provider = fields.get("provider") or "openai"
+        top = fields.get("top", "20")
+        within = fields.get("within_seconds") or fields.get("recent_seconds") or fields.get("within") or "30"
+        try:
+            top_i = int(top)
+        except Exception:
+            top_i = 20
+        try:
+            within_i = int(within)
+        except Exception:
+            within_i = 30
+        top_i = min(max(top_i, 1), 200)
+        within_i = min(max(within_i, 1), 300)
+
+        try:
+            result = perform_sms_fetch(
+                account_line=account_line,
+                top=top_i,
+                folder=fields.get("folder") or "INBOX",
+                token_kind=fields.get("token_kind") or "auto",
+                refresh_endpoint=fields.get("refresh_endpoint") or "auto",
+                tenant=fields.get("tenant") or "consumers",
+                timeout=SMS_FETCH_TIMEOUT,
+            )
+            self._send_json(api_code_response(result, recent_seconds=within_i, provider=provider))
+        except ValueError as exc:
+            self._send_json({"ok": False, "reason": "bad_account", "message": str(exc)}, code=400)
+        except Exception as exc:
+            message = str(exc)
+            reason = "auth_failed" if is_auth_or_token_error(message) else "mail_timeout" if is_network_error(message) else "upstream_error"
+            self._send_json({"ok": False, "reason": reason, "message": message}, code=400)
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+
+        if path in ("/api/sms/code", "/api/sms/latest", "/api/sms/code.txt") or path.startswith(
+            "/api/sms/code/"
+        ):
+            fields: dict[str, str] = {}
+            for key, values in qs.items():
+                fields[key] = (values[0] if values else "").strip()
+            if path.startswith("/api/sms/code/"):
+                fields.setdefault(
+                    "account_line",
+                    urllib.parse.unquote(path[len("/api/sms/code/") :]).strip(),
+                )
+            fmt = (fields.get("format") or "").lower()
+            wants_text = path == "/api/sms/code.txt" or fmt in ("text", "txt", "plain") or fields.get("plain") == "1"
+            self._send_latest_code_result(fields, wants_text=wants_text)
+            return
+
+        if path == "/api/text-relay" or path.startswith("/api/text-relay/"):
+            fields: dict[str, str] = {}
+            for key, values in qs.items():
+                fields[key] = (values[0] if values else "").strip()
+            if path.startswith("/api/text-relay/"):
+                fields.setdefault(
+                    "account_line",
+                    urllib.parse.unquote(path[len("/api/text-relay/") :]).strip(),
+                )
+            self._send_latest_code_result(fields, relay_text=True)
+            return
 
         if path == "/":
             body = """
@@ -942,7 +1785,8 @@ class AppHandler(BaseHTTPRequestHandler):
               <h1>功能选择</h1>
               <div class="row">
                 <a class="btn" href="/reward">打赏</a>
-                <a class="btn gray" href="/sms">接码</a>
+                <a class="btn green" href="/sms">验证码</a>
+                <a class="btn gray" href="/sms/list">邮件列表</a>
                 <a class="btn green" href="/admin">管理员</a>
               </div>
             </div>
@@ -997,8 +1841,12 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_bytes(img.read_bytes(), ctype)
             return
 
-        if path == "/sms":
-            self._send_html(render_layout("接码", sms_form_html()))
+        if path in ("/sms", "/code"):
+            self._send_html(render_layout("验证码读取", code_page_html()))
+            return
+
+        if path == "/sms/list":
+            self._send_html(render_layout("邮件列表", sms_form_html()))
             return
 
         if path == "/admin/logout":
@@ -1029,6 +1877,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 view1 = '<img src="/reward-image?slot=1" alt="图1">'
             if img2:
                 view2 = '<img src="/reward-image?slot=2" alt="图2">'
+            account_search = (qs.get("account_q", [""])[0] or "").strip()
             body = f"""
             <div class="card">
               <h1>管理员面板</h1>
@@ -1055,6 +1904,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 <a class="btn gray" href="/admin/logout">退出登录</a>
               </div>
             </div>
+            {stored_account_table_html(account_search)}
             """
             self._send_html(render_layout("管理员面板", body))
             return
@@ -1065,6 +1915,99 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/api/v1/code":
+            self._send_api_v1_code_result(self._parse_urlencoded())
+            return
+
+        if path in ("/api/sms/code", "/api/sms/latest", "/api/sms/code.txt"):
+            form = self._parse_urlencoded()
+            fmt = (form.get("format") or (qs.get("format", [""])[0] if qs else "")).lower()
+            wants_text = path == "/api/sms/code.txt" or fmt in ("text", "txt", "plain") or form.get("plain") == "1"
+            self._send_latest_code_result(form, wants_text=wants_text)
+            return
+
+        if path == "/api/text-relay":
+            form = self._parse_urlencoded()
+            self._send_latest_code_result(form, relay_text=True)
+            return
+
+        if path == "/api/sms/fetch":
+            form = self._parse_urlencoded()
+            account_line = form.get("account_line", "")
+            top = form.get("top", "20")
+            try:
+                top_i = int(top)
+            except Exception:
+                top_i = 20
+            top_i = min(max(top_i, 1), 200)
+
+            try:
+                result = perform_sms_fetch(
+                    account_line=account_line,
+                    top=top_i,
+                    folder="INBOX",
+                    token_kind="auto",
+                    refresh_endpoint="auto",
+                    tenant="consumers",
+                    timeout=SMS_FETCH_TIMEOUT,
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "account": result.account,
+                        "token_source": result.token_source,
+                        "server": result.server,
+                        "used_folder": result.used_folder,
+                        "top": result.top,
+                        "attempts": result.attempts,
+                        "rows": [
+                            {
+                                "msg_id": row.msg_id,
+                                "date": row.date,
+                                "sender": row.sender,
+                                "subject": row.subject,
+                                "code": row.code,
+                            }
+                            for row in result.rows
+                        ],
+                    }
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, code=400)
+            return
+
+        if path == "/api/sms/view":
+            form = self._parse_urlencoded()
+            account_line = form.get("account_line", "")
+            msg_id = form.get("msg_id", "")
+            folder = form.get("folder", "INBOX") or "INBOX"
+            try:
+                detail = perform_sms_view(
+                    account_line=account_line,
+                    msg_id=msg_id,
+                    preferred_folder=folder,
+                    timeout=SMS_VIEW_TIMEOUT,
+                )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "account": detail.account,
+                        "token_source": detail.token_source,
+                        "server": detail.server,
+                        "used_folder": detail.used_folder,
+                        "msg_id": detail.msg_id,
+                        "subject": detail.subject,
+                        "sender": detail.sender,
+                        "receiver": detail.receiver,
+                        "date": detail.date,
+                        "body_text": detail.body_text,
+                        "attempts": detail.attempts,
+                    }
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, code=400)
+            return
 
         if path == "/sms/fetch":
             form = self._parse_urlencoded()
@@ -1092,8 +2035,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     token_kind="auto",
                     refresh_endpoint="auto",
                     tenant="consumers",
-                    timeout=20,
+                    timeout=SMS_FETCH_TIMEOUT,
                 )
+                save_account_record(account_line)
                 parts.append(sms_result_html(result))
             except Exception as exc:
                 parts.append(sms_error_html(str(exc)))
@@ -1125,13 +2069,41 @@ class AppHandler(BaseHTTPRequestHandler):
                     account_line=account_line,
                     msg_id=msg_id,
                     preferred_folder=folder,
-                    timeout=20,
+                    timeout=SMS_VIEW_TIMEOUT,
                 )
                 parts.append(sms_detail_html(detail, top_i))
             except Exception as exc:
                 parts.append(sms_error_html(str(exc)))
 
             self._send_html(render_layout("邮件内容", "".join(parts)))
+            return
+
+        if path == "/admin/accounts/add":
+            if not self._is_admin():
+                self._send_html(
+                    render_layout(
+                        "请先登录",
+                        '<div class="card"><p>请先登录。</p><a class="btn" href="/admin">去登录</a></div>',
+                    ),
+                    code=401,
+                )
+                return
+            form = self._parse_urlencoded()
+            added, errors = add_account_lines(form.get("account_lines", ""))
+            if errors and not added:
+                error_html = "<br>".join(html.escape(x) for x in errors)
+                body = f"""
+                <div class="card">
+                  <h1>添加失败</h1>
+                  <p class="err">{error_html}</p>
+                  <a class="btn gray" href="/admin">返回管理</a>
+                </div>
+                """
+                self._send_html(render_layout("添加失败", body), code=400)
+                return
+            self.send_response(303)
+            self.send_header("Location", "/admin")
+            self.end_headers()
             return
 
         if path == "/admin/login":

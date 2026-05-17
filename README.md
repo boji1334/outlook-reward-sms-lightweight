@@ -21,7 +21,11 @@
   - 管理员
 - 打赏页：`/reward`
   - 固定显示 2 张图（图1、图2）
-- 接码页：`/sms`
+- 客户验证码页：`/sms` 或 `/code`
+  - 粘贴账号信息后点击“获取验证码”
+  - 默认只返回最近 30 秒内的 OpenAI 验证码
+  - 页面通过 `POST /api/v1/code` 调用后端，不把 token 放进地址栏
+- 邮件列表页：`/sms/list`
   - 输入账号行：`email----password----client_id----token`
   - 点击“连接并读取”显示邮件列表（日期/发件人/主题）
   - 点击“刷新最新邮件”拉取新邮件
@@ -49,6 +53,78 @@ python .\app.py
 - `http://127.0.0.1:2020`
 
 注意：不要使用 `http://0.0.0.0:2020` 访问。
+
+### 直接获取最新验证码接口
+
+如果只想拿验证码，不需要邮件表格，可以调用：
+
+- `GET /api/sms/code`
+- `POST /api/sms/code`
+
+GET 示例（账号行必须 URL 编码）：
+
+```text
+http://127.0.0.1:2020/api/sms/code?account_line=<urlencoded email----password----client_id----token>
+```
+
+POST 表单示例：
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:2020/api/sms/code `
+  -Body @{ account_line = "email----password----client_id----refresh_token"; top = "20" }
+```
+
+返回 JSON 会把验证码放在顶层 `code` 字段。只要纯文本验证码时，调用 `/api/sms/code.txt` 或加 `format=text`。
+
+正式程序接口：
+
+```http
+POST /api/v1/code
+Content-Type: application/json
+```
+
+请求示例：
+
+```json
+{
+  "account_line": "email----password----client_id----refresh_token",
+  "provider": "openai",
+  "within_seconds": 30,
+  "top": 20
+}
+```
+
+成功示例：
+
+```json
+{
+  "ok": true,
+  "code": "123456",
+  "provider": "openai",
+  "email": "user@outlook.com",
+  "age_seconds": 8,
+  "subject": "..."
+}
+```
+
+浏览器直接显示一句话的接口：
+
+```text
+http://127.0.0.1:2020/api/text-relay/<urlencoded email----password----client_id----token>
+```
+
+这个接口默认只返回邮件时间在最近 30 秒内的验证码。可以用 `recent_seconds` 改窗口：
+
+```text
+http://127.0.0.1:2020/api/text-relay/<账号信息>?recent_seconds=60
+```
+
+成功示例：
+
+```text
+YES|您的 OpenAI 验证代码是: 123456
+```
 
 ### 服务器部署（2020端口）
 
@@ -91,7 +167,11 @@ Main program:
   - Admin
 - Reward page: `/reward`
   - Shows exactly 2 images (slot 1 and slot 2)
-- SMS page: `/sms`
+- Customer code page: `/sms` or `/code`
+  - Paste account info and click **Get Code**
+  - Defaults to OpenAI codes from emails dated within the last 30 seconds
+  - Uses `POST /api/v1/code` so the token is not placed in the browser address bar
+- Mail list page: `/sms/list`
   - Input account line: `email----password----client_id----token`
   - Click **Connect and Fetch** to load message list (date/from/subject)
   - Click **Refresh Latest** to get new messages
@@ -119,6 +199,78 @@ Default URL:
 - `http://127.0.0.1:2020`
 
 Do not browse with `http://0.0.0.0:2020`.
+
+### Direct Latest-Code API
+
+Use this when you only need the newest verification code instead of the full mail table:
+
+- `GET /api/sms/code`
+- `POST /api/sms/code`
+
+GET example:
+
+```text
+http://127.0.0.1:2020/api/sms/code?account_line=<urlencoded email----password----client_id----token>
+```
+
+POST form example:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:2020/api/sms/code `
+  -Body @{ account_line = "email----password----client_id----refresh_token"; top = "20" }
+```
+
+The JSON response puts the verification code at top-level `code`. For code-only text output, call `/api/sms/code.txt` or add `format=text`.
+
+Primary programmatic API:
+
+```http
+POST /api/v1/code
+Content-Type: application/json
+```
+
+Request example:
+
+```json
+{
+  "account_line": "email----password----client_id----refresh_token",
+  "provider": "openai",
+  "within_seconds": 30,
+  "top": 20
+}
+```
+
+Success example:
+
+```json
+{
+  "ok": true,
+  "code": "123456",
+  "provider": "openai",
+  "email": "user@outlook.com",
+  "age_seconds": 8,
+  "subject": "..."
+}
+```
+
+Browser-friendly one-line relay:
+
+```text
+http://127.0.0.1:2020/api/text-relay/<urlencoded email----password----client_id----token>
+```
+
+This endpoint only returns codes from emails dated within the last 30 seconds by default. Use `recent_seconds` to change the window:
+
+```text
+http://127.0.0.1:2020/api/text-relay/<account-line>?recent_seconds=60
+```
+
+Success example:
+
+```text
+YES|您的 OpenAI 验证代码是: 123456
+```
 
 ### Deploy on Server (Port 2020)
 
