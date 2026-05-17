@@ -21,15 +21,15 @@
   - 管理员
 - 打赏页：`/reward`
   - 固定显示 2 张图（图1、图2）
-- 客户验证码页：`/sms` 或 `/code`
+- 客户验证码页：`/code`
   - 粘贴账号信息后点击“获取验证码”
   - 默认只返回最近 30 秒内的 OpenAI 验证码
   - 页面通过 `POST /api/v1/code` 调用后端，不把 token 放进地址栏
-- 邮件列表页：`/sms/list`
+- 邮件列表页：`/sms` 或 `/sms/list`
   - 输入账号行：`email----password----client_id----token`
-  - 点击“连接并读取”显示邮件列表（日期/发件人/主题）
-  - 点击“刷新最新邮件”拉取新邮件
-  - 点击“查看全文”查看该邮件完整内容
+  - 点击“读取全部邮件”动态显示邮件列表（日期/发件人/主题）
+  - 读取和打开全文时显示转圈和进度条
+  - 点击“查看全文”用 HTML 预览打开邮件原貌
 - 管理员页：`/admin`
   - 登录后可分别上传打赏图1/图2
 
@@ -167,15 +167,15 @@ Main program:
   - Admin
 - Reward page: `/reward`
   - Shows exactly 2 images (slot 1 and slot 2)
-- Customer code page: `/sms` or `/code`
+- Customer code page: `/code`
   - Paste account info and click **Get Code**
   - Defaults to OpenAI codes from emails dated within the last 30 seconds
   - Uses `POST /api/v1/code` so the token is not placed in the browser address bar
-- Mail list page: `/sms/list`
+- Mail list page: `/sms` or `/sms/list`
   - Input account line: `email----password----client_id----token`
-  - Click **Connect and Fetch** to load message list (date/from/subject)
-  - Click **Refresh Latest** to get new messages
-  - Click **View Full** to load full content of one message
+  - Click **Fetch Mail** to dynamically load the message list (date/from/subject)
+  - Shows a spinner and progress bar while loading
+  - Click **View Full** to preview the original HTML email
 - Admin page: `/admin`
   - Upload reward image slot 1 / slot 2
 

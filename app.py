@@ -130,6 +130,7 @@ class SmsDetailResult:
     receiver: str
     date: str
     body_text: str
+    body_html: str
     attempts: list[str]
     raw_line: str
 
@@ -814,7 +815,7 @@ def html_to_text(raw_html: str) -> str:
     return text.strip()
 
 
-def extract_body_text(msg) -> str:
+def extract_body_parts(msg) -> tuple[str, str]:
     plain_parts: list[str] = []
     html_parts: list[str] = []
     if msg.is_multipart():
@@ -840,12 +841,14 @@ def extract_body_text(msg) -> str:
             plain_parts.append(text)
 
     plain = "\n\n".join(p.strip() for p in plain_parts if p and p.strip()).strip()
-    if plain:
-        return plain
     html_body = "\n\n".join(p for p in html_parts if p).strip()
-    if html_body:
-        return html_to_text(html_body)
-    return ""
+    text_body = plain or (html_to_text(html_body) if html_body else "")
+    return text_body, html_body
+
+
+def extract_body_text(msg) -> str:
+    text_body, _ = extract_body_parts(msg)
+    return text_body
 
 
 def fetch_imap_message_detail(
@@ -874,12 +877,14 @@ def fetch_imap_message_detail(
             raise RuntimeError("邮件内容为空")
 
         msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+        body_text, body_html = extract_body_parts(msg)
         return {
             "subject": decode_mime_header(str(msg.get("Subject", "")).strip()),
             "sender": decode_mime_header(str(msg.get("From", "")).strip()),
             "receiver": decode_mime_header(str(msg.get("To", "")).strip()),
             "date": decode_mime_header(str(msg.get("Date", "")).strip()),
-            "body_text": extract_body_text(msg),
+            "body_text": body_text,
+            "body_html": body_html,
         }
     finally:
         try:
@@ -1035,6 +1040,7 @@ def perform_sms_view(
                     receiver=detail["receiver"],
                     date=detail["date"],
                     body_text=detail["body_text"],
+                    body_html=detail.get("body_html", ""),
                     attempts=attempts,
                     raw_line=account_line,
                 )
@@ -1295,34 +1301,208 @@ def sms_form_html(
 ) -> str:
     return f"""
     <div class="card">
-      <h1>\u8f7b\u91cf Outlook \u90ae\u7bb1\u67e5\u770b</h1>
-      <form method="post" action="/sms/fetch">
-        <label>\u8d26\u53f7\u884c\uff08email----password----client_id----token\uff09</label>
-        <textarea name="account_line" placeholder="\u7c98\u8d34\u5b8c\u6574\u8d26\u53f7\u884c" required>{html.escape(account_line)}</textarea>
-        <div class="grid" style="margin-top:10px;max-width:280px">
-          <label>\u8bfb\u53d6\u6570\u91cf
-            <input type="number" name="top" min="1" max="200" value="{html.escape(top)}">
+      <h1>Outlook 邮件查看</h1>
+      <form id="mailForm">
+        <label>账号行（email----password----client_id----token）</label>
+        <textarea id="accountLine" name="account_line" placeholder="粘贴完整账号行" required>{html.escape(account_line)}</textarea>
+        <div class="grid" style="margin-top:10px;max-width:420px">
+          <label>读取数量
+            <input id="topCount" type="number" name="top" min="1" max="200" value="{html.escape(top)}">
           </label>
         </div>
         <div class="row" style="margin-top:10px">
-          <button class="btn" type="submit">\u5f00\u59cb\u8bfb\u53d6</button>
-          <a class="btn gray" href="/">\u8fd4\u56de\u9996\u9875</a>
+          <button id="fetchButton" class="btn" type="submit">读取全部邮件</button>
+          <button id="clearButton" class="btn gray" type="button">清空</button>
+          <a class="btn gray" href="/code">30秒验证码</a>
         </div>
       </form>
-      <p class="note">\u9ed8\u8ba4\u4f18\u5148\u8bfb\u53d6 INBOX\uff0c\u5e76\u81ea\u52a8\u5c1d\u8bd5 token \u5019\u9009\uff08\u7f13\u5b58/\u539f\u59cb/\u5237\u65b0\uff09\u3002</p>
+      <p class="note">默认读取 INBOX 最新邮件。点击“查看全文”会以 HTML 邮件原貌打开，方便确认真实邮件页面。</p>
+      <div id="loading" class="loading" hidden>
+        <span class="spinner"></span>
+        <span id="loadingText">正在连接 Outlook...</span>
+        <div class="progress"><span></span></div>
+      </div>
+      <p id="status" class="note">等待输入账号信息。</p>
     </div>
+
     <div class="card">
-      <h3 style="margin-top:0">\u5f00\u6e90\u9879\u76ee</h3>
-      <p class="small" style="font-size:14px;color:#444;line-height:1.8">
-        \u6e90\u7801\u6765\u81ea\uff1a
-        <a href="https://github.com/boji1334/outlook-reward-sms-lightweight" target="_blank" rel="noopener noreferrer">
-          https://github.com/boji1334/outlook-reward-sms-lightweight
-        </a>
-      </p>
-      <p class="small" style="font-size:14px;color:#444;line-height:1.8">
-        \u5982\u679c\u8fd9\u4e2a\u5de5\u5177\u5bf9\u4f60\u6709\u5e2e\u52a9\uff0c\u6b22\u8fce\u5728 GitHub \u70b9\u4e2a Star \u5e76\u5173\u6ce8\uff0c\u652f\u6301\u9879\u76ee\u6301\u7eed\u66f4\u65b0\u3002
-      </p>
+      <h2>读取结果</h2>
+      <table>
+        <thead><tr><th style="width:60px">编号</th><th style="width:250px">日期</th><th>发件人</th><th>主题</th><th style="width:100px">验证码</th><th style="width:130px">操作</th></tr></thead>
+        <tbody id="resultRows"><tr><td colspan="6" class="small">还没有读取结果。</td></tr></tbody>
+      </table>
     </div>
+
+    <div id="detailCard" class="card" hidden>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 id="detailTitle" style="margin:0">邮件全文</h2>
+        <button id="closeDetail" class="btn gray" type="button">关闭</button>
+      </div>
+      <p id="detailMeta" class="small"></p>
+      <iframe id="mailFrame" sandbox="" style="width:100%;min-height:680px;border:1px solid #ddd;border-radius:8px;background:#fff"></iframe>
+    </div>
+
+    <style>
+      .loading{{margin-top:12px;border:1px solid #ddd;border-radius:8px;padding:12px;background:#fbfcff;color:#555}}
+      .spinner{{display:inline-block;width:18px;height:18px;border:3px solid #d6dde8;border-top-color:#0d6efd;border-radius:50%;vertical-align:-4px;margin-right:8px;animation:spin .8s linear infinite}}
+      .progress{{height:6px;border-radius:999px;background:#e8edf5;margin-top:10px;overflow:hidden}}
+      .progress span{{display:block;width:42%;height:100%;border-radius:inherit;background:#0d6efd;animation:slide 1.1s ease-in-out infinite}}
+      @keyframes spin{{to{{transform:rotate(360deg)}}}}
+      @keyframes slide{{0%{{transform:translateX(-110%)}}50%{{transform:translateX(80%)}}100%{{transform:translateX(260%)}}}}
+      table button{{white-space:nowrap}}
+    </style>
+
+    <script>
+      const form = document.querySelector('#mailForm');
+      const accountLine = document.querySelector('#accountLine');
+      const topCount = document.querySelector('#topCount');
+      const fetchButton = document.querySelector('#fetchButton');
+      const clearButton = document.querySelector('#clearButton');
+      const loading = document.querySelector('#loading');
+      const loadingText = document.querySelector('#loadingText');
+      const statusBox = document.querySelector('#status');
+      const resultRows = document.querySelector('#resultRows');
+      const detailCard = document.querySelector('#detailCard');
+      const detailTitle = document.querySelector('#detailTitle');
+      const detailMeta = document.querySelector('#detailMeta');
+      const mailFrame = document.querySelector('#mailFrame');
+      const closeDetail = document.querySelector('#closeDetail');
+      let lastAccountLine = '';
+      let lastFolder = 'INBOX';
+
+      function escapeHtml(value) {{
+        return String(value ?? '').replace(/[&<>"']/g, (char) => ({{
+          '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }}[char]));
+      }}
+
+      function normalizeAccountInput(value) {{
+        let text = String(value ?? '')
+          .replace(/[\\u200b-\\u200f\\u202a-\\u202e\\u2060\\ufeff]/g, '')
+          .replace(/\\u00a0/g, ' ')
+          .replace(/[\\u2010-\\u2015\\u2212\\ufe63\\uff0d]/g, '-')
+          .trim();
+        text = text.replace(/\\s*(?:-\\s*){{4}}\\s*/g, '----');
+        const lines = text.split(/\\r?\\n/).map((line) => line.trim()).filter(Boolean);
+        if (!text.includes('----') && lines.length >= 4 && lines[0].includes('@')) {{
+          text = `${{lines[0]}}----${{lines[1]}}----${{lines[2]}}----${{lines.slice(3).join('')}}`;
+        }}
+        return text;
+      }}
+
+      function setLoading(active, text) {{
+        loading.hidden = !active;
+        loadingText.textContent = text || '正在处理...';
+        fetchButton.disabled = active;
+      }}
+
+      async function postForm(path, data) {{
+        const body = new URLSearchParams();
+        Object.entries(data).forEach(([key, value]) => body.append(key, value));
+        const response = await fetch(path, {{ method: 'POST', body }});
+        const json = await response.json().catch(() => ({{}}));
+        if (!response.ok || !json.ok) {{
+          throw new Error(json.error || json.message || `请求失败：${{response.status}}`);
+        }}
+        return json;
+      }}
+
+      function renderRows(rows) {{
+        if (!rows.length) {{
+          resultRows.innerHTML = '<tr><td colspan="6" class="small">没有读取到邮件。</td></tr>';
+          return;
+        }}
+        resultRows.innerHTML = rows.map((row, index) => {{
+          const code = row.code ? `<b>${{escapeHtml(row.code)}}</b>` : '-';
+          return `
+            <tr>
+              <td>${{index + 1}}</td>
+              <td>${{escapeHtml(row.date || '-')}}</td>
+              <td>${{escapeHtml(row.sender || '-')}}</td>
+              <td>${{escapeHtml(row.subject || '-')}}</td>
+              <td>${{code}}</td>
+              <td><button class="btn gray" type="button" data-view="${{escapeHtml(row.msg_id)}}">查看全文</button></td>
+            </tr>
+          `;
+        }}).join('');
+      }}
+
+      async function fetchMail() {{
+        const value = normalizeAccountInput(accountLine.value);
+        if (!value) {{
+          statusBox.textContent = '请先粘贴账号信息。';
+          return;
+        }}
+        accountLine.value = value;
+        lastAccountLine = value;
+        detailCard.hidden = true;
+        setLoading(true, '正在连接 Outlook 并读取邮件列表...');
+        statusBox.textContent = '读取中，请稍候。';
+        resultRows.innerHTML = '<tr><td colspan="6" class="small">读取中...</td></tr>';
+        try {{
+          const data = await postForm('/api/sms/fetch', {{
+            account_line: value,
+            top: String(topCount.value || '20'),
+          }});
+          lastFolder = data.used_folder || 'INBOX';
+          renderRows(data.rows || []);
+          statusBox.textContent = `读取成功：${{data.account}}，文件夹：${{lastFolder}}`;
+        }} catch (error) {{
+          resultRows.innerHTML = '<tr><td colspan="6" class="small">读取失败。</td></tr>';
+          statusBox.textContent = error.message || '读取失败。';
+        }} finally {{
+          setLoading(false, '');
+        }}
+      }}
+
+      async function viewMail(msgId) {{
+        if (!lastAccountLine || !msgId) return;
+        setLoading(true, '正在打开邮件全文...');
+        statusBox.textContent = '正在读取邮件全文。';
+        try {{
+          const data = await postForm('/api/sms/view', {{
+            account_line: lastAccountLine,
+            msg_id: msgId,
+            folder: lastFolder,
+          }});
+          detailTitle.textContent = data.subject || '邮件全文';
+          detailMeta.textContent = `${{data.sender || ''}}  ${{data.date || ''}}`;
+          if (data.body_html) {{
+            mailFrame.srcdoc = data.body_html;
+          }} else {{
+            mailFrame.srcdoc = `<pre style="white-space:pre-wrap;font:14px/1.6 ui-monospace,Consolas,monospace">${{escapeHtml(data.body_text || '没有正文内容。')}}</pre>`;
+          }}
+          detailCard.hidden = false;
+          detailCard.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+          statusBox.textContent = '邮件全文已打开。';
+        }} catch (error) {{
+          statusBox.textContent = error.message || '读取全文失败。';
+        }} finally {{
+          setLoading(false, '');
+        }}
+      }}
+
+      form.addEventListener('submit', (event) => {{
+        event.preventDefault();
+        void fetchMail();
+      }});
+      clearButton.addEventListener('click', () => {{
+        accountLine.value = '';
+        resultRows.innerHTML = '<tr><td colspan="6" class="small">还没有读取结果。</td></tr>';
+        detailCard.hidden = true;
+        statusBox.textContent = '等待输入账号信息。';
+      }});
+      closeDetail.addEventListener('click', () => {{
+        detailCard.hidden = true;
+        mailFrame.srcdoc = '';
+      }});
+      resultRows.addEventListener('click', (event) => {{
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const msgId = target.getAttribute('data-view');
+        if (msgId) void viewMail(msgId);
+      }});
+    </script>
     """
 
 
@@ -1488,6 +1668,20 @@ def sms_error_html(err: str) -> str:
 def sms_detail_html(detail: SmsDetailResult, top: int) -> str:
     attempts_html = "<br>".join(html.escape(x) for x in detail.attempts)
     body = detail.body_text or "(空内容)"
+    if detail.body_html:
+        body_view = (
+            '<iframe sandbox="" style="width:100%;min-height:680px;border:1px solid #ddd;'
+            'border-radius:8px;background:#fff" srcdoc="'
+            + html.escape(detail.body_html, quote=True)
+            + '"></iframe>'
+        )
+    else:
+        body_view = (
+            '<pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #ddd;'
+            'border-radius:8px;padding:12px">'
+            + html.escape(body)
+            + '</pre>'
+        )
     return f"""
     <div class="card">
       <h2>邮件完整内容</h2>
@@ -1500,7 +1694,7 @@ def sms_detail_html(detail: SmsDetailResult, top: int) -> str:
       <p><b>发件人:</b> {html.escape(detail.sender)}</p>
       <p><b>收件人:</b> {html.escape(detail.receiver)}</p>
       <p><b>日期:</b> {html.escape(detail.date)}</p>
-      <pre style="white-space:pre-wrap;background:#fafafa;border:1px solid #ddd;border-radius:8px;padding:12px">{html.escape(body)}</pre>
+      {body_view}
       <form method="post" action="/sms/fetch" style="margin-top:8px">
         <input type="hidden" name="account_line" value="{html.escape(detail.raw_line)}">
         <input type="hidden" name="top" value="{top}">
@@ -1785,8 +1979,8 @@ class AppHandler(BaseHTTPRequestHandler):
               <h1>功能选择</h1>
               <div class="row">
                 <a class="btn" href="/reward">打赏</a>
-                <a class="btn green" href="/sms">验证码</a>
-                <a class="btn gray" href="/sms/list">邮件列表</a>
+                <a class="btn green" href="/code">验证码</a>
+                <a class="btn gray" href="/sms">邮件列表</a>
                 <a class="btn green" href="/admin">管理员</a>
               </div>
             </div>
@@ -1841,11 +2035,11 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_bytes(img.read_bytes(), ctype)
             return
 
-        if path in ("/sms", "/code"):
+        if path == "/code":
             self._send_html(render_layout("验证码读取", code_page_html()))
             return
 
-        if path == "/sms/list":
+        if path in ("/sms", "/sms/list"):
             self._send_html(render_layout("邮件列表", sms_form_html()))
             return
 
@@ -2002,6 +2196,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "receiver": detail.receiver,
                         "date": detail.date,
                         "body_text": detail.body_text,
+                        "body_html": detail.body_html,
                         "attempts": detail.attempts,
                     }
                 )
