@@ -1414,7 +1414,7 @@ def code_page_html() -> str:
             setResult(escapeHtml(data.message || '未找到验证码'), 'err');
           }
         } catch (error) {
-          setResult('请求失败，请稍后重试', 'err');
+          setResult('后端接口连接失败，请检查服务是否已部署并重启。', 'err');
         } finally {
           button.disabled = false;
         }
