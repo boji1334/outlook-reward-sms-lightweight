@@ -1327,20 +1327,21 @@ def sms_form_html(
     return f"""
     <div class="sms-lite">
       <aside class="account-panel">
-        <h1>账号信息</h1>
+        <h1>邮箱账号</h1>
+        <p class="panel-subtitle">粘贴账号后点击读取，系统会同时加载邮件列表和最新验证码。</p>
         <form id="mailForm">
-          <label>账号行</label>
-          <textarea id="accountLine" name="account_line" placeholder="email----password----client_id----token" required>{html.escape(account_line)}</textarea>
+          <label>账号信息</label>
+          <textarea id="accountLine" name="account_line" placeholder="email----password----client_id----refresh_token" spellcheck="false" autocomplete="off" required>{html.escape(account_line)}</textarea>
           <div class="compact-grid">
-            <label>数量
+            <label>邮件数量
               <input id="topCount" type="number" name="top" min="1" max="200" value="{html.escape(top)}">
             </label>
-            <label>实时窗口
+            <label>验证码时效
               <input id="withinSeconds" type="number" name="within_seconds" min="1" max="300" value="30">
             </label>
           </div>
           <div class="action-row">
-            <button id="fetchButton" class="btn" type="submit">读取邮件</button>
+            <button id="fetchButton" class="btn" type="submit">读取邮箱</button>
             <button id="clearButton" class="btn gray" type="button">清空</button>
           </div>
         </form>
@@ -1352,13 +1353,19 @@ def sms_form_html(
         <p id="status" class="note">等待输入账号信息。</p>
 
         <section class="realtime-panel">
-          <h2>实时邮箱信息</h2>
-          <div id="codeResult" class="code-result">等待读取最近 30 秒验证码。</div>
+          <h2>实时验证码</h2>
+          <div id="codeResult" class="code-result">读取后显示最近 30 秒内的验证码。</div>
         </section>
       </aside>
 
       <main class="mail-panel">
-        <h2>全部邮件列表</h2>
+        <div class="section-head">
+          <div>
+            <h2>邮件列表</h2>
+            <p class="panel-subtitle">点击右侧按钮即可查看邮件原文。</p>
+          </div>
+          <span id="mailCount" class="count-badge">0 封</span>
+        </div>
         <div class="mail-list">
           <table class="mail-table">
             <thead>
@@ -1377,51 +1384,63 @@ def sms_form_html(
 
       <aside id="detailPane" class="preview-panel">
         <div class="preview-head">
-          <h2 id="detailTitle">原邮件预览</h2>
-          <p id="detailMeta" class="small">点击邮件列表中的“查看全文”，这里会直接显示原邮件；再点其他邮件会直接覆盖。</p>
+          <h2 id="detailTitle">邮件原文</h2>
+          <p id="detailMeta" class="small">选择一封邮件后，原始内容会显示在这里。再次点击其他邮件会直接切换。</p>
         </div>
         <iframe id="mailFrame" sandbox="" title="邮件原文预览"></iframe>
       </aside>
     </div>
 
     <style>
-      .wrap{{max-width:none;margin:0;padding:12px}}
-      body{{background:#f4f6f8;font-family:Arial,"Microsoft YaHei",sans-serif}}
-      .sms-lite{{display:grid;grid-template-columns:280px minmax(520px,1fr) minmax(420px,42vw);gap:12px;align-items:start}}
-      .account-panel,.mail-panel,.preview-panel{{background:#fff;border:1px solid #ddd;border-radius:8px;padding:14px}}
+      .wrap{{max-width:none;margin:0;padding:16px}}
+      body{{background:#f5f7fb;color:#141c2f;font-family:Arial,"Microsoft YaHei",sans-serif}}
+      .sms-lite{{display:grid;grid-template-columns:300px minmax(640px,44vw) minmax(420px,1fr);gap:14px;align-items:start}}
+      .account-panel,.mail-panel,.preview-panel{{background:#fff;border:1px solid #dde3ee;border-radius:10px;padding:18px;box-shadow:0 12px 34px rgba(20,28,47,.06)}}
       .account-panel{{position:sticky;top:12px}}
-      .account-panel h1,.mail-panel h2,.preview-panel h2,.realtime-panel h2{{font-size:18px;margin:0 0 10px}}
-      .account-panel textarea{{box-sizing:border-box;min-height:112px;font-size:12px;line-height:1.45;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}}
-      .compact-grid{{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}}
+      .account-panel h1,.mail-panel h2,.preview-panel h2,.realtime-panel h2{{font-size:20px;line-height:1.25;margin:0 0 8px;font-weight:800;color:#101828}}
+      .panel-subtitle{{margin:0 0 14px;color:#667085;font-size:13px;line-height:1.55}}
+      label{{display:block;margin-bottom:6px;color:#344054;font-size:13px;font-weight:700}}
+      .account-panel textarea{{box-sizing:border-box;min-height:136px;font-size:12px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;border-color:#d7deea;background:#fbfdff}}
+      .compact-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}}
       .compact-grid input{{box-sizing:border-box;width:100%;min-width:0}}
-      .action-row{{display:flex;gap:8px;margin-top:10px}}
-      .action-row .btn{{flex:1;padding:9px 10px}}
-      .loading{{margin-top:12px;border:1px solid #ddd;border-radius:8px;padding:10px;background:#fbfcff;color:#555;font-size:13px}}
-      .spinner{{display:inline-block;width:18px;height:18px;border:3px solid #d6dde8;border-top-color:#0d6efd;border-radius:50%;vertical-align:-4px;margin-right:8px;animation:spin .8s linear infinite}}
+      .action-row{{display:flex;gap:10px;margin-top:12px}}
+      .action-row .btn{{flex:1;padding:10px 12px;font-weight:800}}
+      .btn{{border-radius:8px;background:#1769e0}}
+      .btn.gray{{background:#eef2f7;color:#344054}}
+      .loading{{margin-top:12px;border:1px solid #d7deea;border-radius:8px;padding:11px;background:#fbfdff;color:#667085;font-size:13px}}
+      .spinner{{display:inline-block;width:18px;height:18px;border:3px solid #d6dde8;border-top-color:#1769e0;border-radius:50%;vertical-align:-4px;margin-right:8px;animation:spin .8s linear infinite}}
       .progress{{height:6px;border-radius:999px;background:#e8edf5;margin-top:10px;overflow:hidden}}
-      .progress span{{display:block;width:42%;height:100%;border-radius:inherit;background:#0d6efd;animation:slide 1.1s ease-in-out infinite}}
+      .progress span{{display:block;width:42%;height:100%;border-radius:inherit;background:#1769e0;animation:slide 1.1s ease-in-out infinite}}
       @keyframes spin{{to{{transform:rotate(360deg)}}}}
       @keyframes slide{{0%{{transform:translateX(-110%)}}50%{{transform:translateX(80%)}}100%{{transform:translateX(260%)}}}}
-      .realtime-panel{{margin-top:14px;border-top:1px solid #eee;padding-top:14px}}
-      .code-result{{border:1px solid #ddd;border-radius:8px;background:#fbfcff;min-height:74px;padding:12px;color:#555;line-height:1.6}}
+      #status{{margin-top:12px;padding-top:12px;border-top:1px solid #eef2f7;color:#667085;line-height:1.55}}
+      .realtime-panel{{margin-top:18px;border-top:1px solid #eef2f7;padding-top:18px}}
+      .code-result{{border:1px solid #d7deea;border-radius:8px;background:#fbfdff;min-height:88px;padding:14px;color:#667085;line-height:1.6}}
       .code-result.ok{{border-color:#b7e4c7;background:#f2fbf6;color:#11623a}}
       .code-result.err{{border-color:#f2b8b5;background:#fff6f5;color:#b42318}}
-      .code-big{{display:block;font-size:30px;font-weight:800;line-height:1.25;letter-spacing:0;margin-top:4px;color:#111}}
-      .mail-list{{overflow:auto;max-height:calc(100vh - 76px);border:1px solid #e4e7eb;border-radius:8px}}
+      .code-big{{display:block;font-size:34px;font-weight:900;line-height:1.25;letter-spacing:0;margin-top:4px;color:#101828}}
+      .section-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}}
+      .section-head h2{{margin-bottom:4px}}
+      .count-badge{{display:inline-flex;align-items:center;justify-content:center;min-width:54px;height:30px;padding:0 10px;border-radius:999px;background:#eef5ff;color:#1769e0;font-size:13px;font-weight:800;white-space:nowrap}}
+      .mail-list{{overflow:auto;max-height:calc(100vh - 104px);border:1px solid #e4e7eb;border-radius:8px;background:#fff}}
       .mail-table{{table-layout:fixed;margin:0}}
-      .mail-table th,.mail-table td{{font-size:13px;line-height:1.35;padding:8px;border-color:#e4e7eb;overflow-wrap:anywhere}}
-      .mail-table th{{position:sticky;top:0;z-index:1;background:#f3f5f7}}
-      .mail-table tr:hover td{{background:#fafcff}}
+      .mail-table th,.mail-table td{{font-size:13px;line-height:1.45;padding:10px;border-color:#e7ecf3;overflow:hidden;text-overflow:ellipsis}}
+      .mail-table th{{position:sticky;top:0;z-index:1;background:#f7f9fc;color:#344054;font-weight:800;white-space:nowrap}}
+      .mail-table td{{height:72px;color:#1f2937;vertical-align:middle}}
+      .mail-table tr:hover td{{background:#f8fbff}}
       .col-index{{width:48px}}
-      .col-date{{width:126px}}
-      .col-sender{{width:220px}}
-      .col-action{{width:92px}}
-      .view-btn{{padding:7px 10px;border-radius:7px;white-space:nowrap;background:#0d6efd}}
+      .col-date{{width:118px}}
+      .col-sender{{width:240px}}
+      .col-action{{width:104px}}
+      .mail-date{{white-space:normal;color:#475467;font-size:12px;line-height:1.35}}
+      .mail-sender{{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+      .mail-subject{{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.45;overflow-wrap:break-word}}
+      .view-btn{{padding:8px 10px;border-radius:8px;white-space:nowrap;background:#1769e0;font-size:13px;font-weight:800}}
       .preview-panel{{position:sticky;top:12px;min-height:calc(100vh - 54px)}}
-      .preview-head{{border-bottom:1px solid #eee;margin-bottom:10px;padding-bottom:10px}}
+      .preview-head{{border-bottom:1px solid #eef2f7;margin-bottom:12px;padding-bottom:12px}}
       .preview-head h2{{margin-bottom:6px}}
-      #mailFrame{{box-sizing:border-box;width:100%;height:calc(100vh - 142px);min-height:520px;border:1px solid #ddd;border-radius:8px;background:#fff}}
-      @media(max-width:1200px){{.sms-lite{{grid-template-columns:260px minmax(440px,1fr)}}.preview-panel{{grid-column:1 / -1;position:static}}#mailFrame{{height:640px}}}}
+      #mailFrame{{box-sizing:border-box;width:100%;height:calc(100vh - 150px);min-height:560px;border:1px solid #dfe5ef;border-radius:8px;background:#fff}}
+      @media(max-width:1320px){{.sms-lite{{grid-template-columns:300px minmax(620px,1fr)}}.preview-panel{{grid-column:1 / -1;position:static}}#mailFrame{{height:680px}}}}
       @media(max-width:760px){{.wrap{{padding:8px}}.sms-lite{{grid-template-columns:1fr}}.account-panel,.preview-panel{{position:static}}.mail-list{{max-height:none}}#mailFrame{{height:520px}}}}
     </style>
 
@@ -1436,6 +1455,7 @@ def sms_form_html(
       const loadingText = document.querySelector('#loadingText');
       const statusBox = document.querySelector('#status');
       const resultRows = document.querySelector('#resultRows');
+      const mailCount = document.querySelector('#mailCount');
       const detailPane = document.querySelector('#detailPane');
       const detailTitle = document.querySelector('#detailTitle');
       const detailMeta = document.querySelector('#detailMeta');
@@ -1502,12 +1522,20 @@ def sms_form_html(
       }}
 
       function clearPreview() {{
-        detailTitle.textContent = '原邮件预览';
-        detailMeta.textContent = '点击邮件列表中的“查看全文”，这里会直接显示原邮件；再点其他邮件会直接覆盖。';
+        detailTitle.textContent = '邮件原文';
+        detailMeta.textContent = '选择一封邮件后，原始内容会显示在这里。再次点击其他邮件会直接切换。';
         mailFrame.srcdoc = '';
       }}
 
+      function formatDate(value) {{
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value || '-';
+        const pad = (num) => String(num).padStart(2, '0');
+        return `${{pad(date.getMonth() + 1)}}/${{pad(date.getDate())}} ${{pad(date.getHours())}}:${{pad(date.getMinutes())}}`;
+      }}
+
       function renderRows(rows) {{
+        mailCount.textContent = `${{rows.length}} 封`;
         if (!rows.length) {{
           resultRows.innerHTML = '<tr><td colspan="5" class="small">没有读取到邮件。</td></tr>';
           return;
@@ -1516,9 +1544,9 @@ def sms_form_html(
           return `
             <tr>
               <td>${{index + 1}}</td>
-              <td>${{escapeHtml(row.date || '-')}}</td>
-              <td>${{escapeHtml(row.sender || '-')}}</td>
-              <td>${{escapeHtml(row.subject || '-')}}</td>
+              <td><div class="mail-date">${{escapeHtml(formatDate(row.date || '-'))}}</div></td>
+              <td><div class="mail-sender" title="${{escapeHtml(row.sender || '-')}}">${{escapeHtml(row.sender || '-')}}</div></td>
+              <td><div class="mail-subject" title="${{escapeHtml(row.subject || '-')}}">${{escapeHtml(row.subject || '-')}}</div></td>
               <td><button class="btn view-btn" type="button" data-view="${{escapeHtml(row.msg_id)}}">查看全文</button></td>
             </tr>
           `;
@@ -1534,8 +1562,9 @@ def sms_form_html(
         accountLine.value = value;
         lastAccountLine = value;
         clearPreview();
-        setLoading(true, '正在连接 Outlook 并读取邮件列表...');
-        statusBox.textContent = '读取中，请稍候。';
+        setLoading(true, '正在连接邮箱，请稍候...');
+        statusBox.textContent = '正在读取邮箱内容。';
+        mailCount.textContent = '读取中';
         resultRows.innerHTML = '<tr><td colspan="5" class="small">读取中...</td></tr>';
         try {{
           const data = await postForm('/api/sms/fetch', {{
@@ -1544,8 +1573,9 @@ def sms_form_html(
           }});
           lastFolder = data.used_folder || 'INBOX';
           renderRows(data.rows || []);
-          statusBox.textContent = `读取成功：${{data.account}}，文件夹：${{lastFolder}}`;
+          statusBox.textContent = `已读取：${{data.account}}`;
         }} catch (error) {{
+          mailCount.textContent = '0 封';
           resultRows.innerHTML = '<tr><td colspan="5" class="small">读取失败。</td></tr>';
           statusBox.textContent = error.message || '读取失败。';
         }} finally {{
@@ -1555,24 +1585,24 @@ def sms_form_html(
 
       async function viewMail(msgId) {{
         if (!lastAccountLine || !msgId) return;
-        setLoading(true, '正在打开邮件全文...');
-        statusBox.textContent = '正在读取邮件全文。';
+        setLoading(true, '正在打开邮件原文...');
+        statusBox.textContent = '正在打开邮件原文。';
         try {{
           const data = await postForm('/api/sms/view', {{
             account_line: lastAccountLine,
             msg_id: msgId,
             folder: lastFolder,
           }});
-          detailTitle.textContent = data.subject || '邮件全文';
+          detailTitle.textContent = data.subject || '邮件原文';
           detailMeta.textContent = `${{data.sender || ''}}  ${{data.date || ''}}`;
           if (data.body_html) {{
             mailFrame.srcdoc = data.body_html;
           }} else {{
             mailFrame.srcdoc = `<pre style="white-space:pre-wrap;font:14px/1.6 ui-monospace,Consolas,monospace">${{escapeHtml(data.body_text || '没有正文内容。')}}</pre>`;
           }}
-          statusBox.textContent = '邮件全文已打开。';
+          statusBox.textContent = '邮件原文已打开。';
         }} catch (error) {{
-          statusBox.textContent = error.message || '读取全文失败。';
+          statusBox.textContent = error.message || '打开邮件原文失败。';
         }} finally {{
           setLoading(false, '');
         }}
@@ -1585,8 +1615,8 @@ def sms_form_html(
           return;
         }}
         accountLine.value = value;
-        setLoading(true, '正在读取 30 秒实时验证码...');
-        setCodeResult('正在读取最近验证码...', '');
+        setLoading(true, '正在读取最新验证码...');
+        setCodeResult('正在查找最近 30 秒内的验证码...', '');
         try {{
           const data = await postJson('/api/v1/code', {{
             account_line: value,
@@ -1596,7 +1626,7 @@ def sms_form_html(
           }});
           if (data.ok) {{
             const age = Number.isFinite(Number(data.age_seconds)) ? `${{data.age_seconds}} 秒前` : '';
-            setCodeResult(`OpenAI 验证码<span class="code-big">${{escapeHtml(data.code)}}</span><span class="small">${{escapeHtml(age)}} ${{escapeHtml(data.subject || '')}}</span>`, 'ok');
+            setCodeResult(`最新验证码<span class="code-big">${{escapeHtml(data.code)}}</span><span class="small">${{escapeHtml(age)}} ${{escapeHtml(data.subject || '')}}</span>`, 'ok');
           }} else {{
             setCodeResult(escapeHtml(data.message || '未找到验证码。'), 'err');
           }}
@@ -1624,8 +1654,9 @@ def sms_form_html(
       clearButton.addEventListener('click', () => {{
         accountLine.value = '';
         resultRows.innerHTML = '<tr><td colspan="5" class="small">还没有读取结果。</td></tr>';
+        mailCount.textContent = '0 封';
         clearPreview();
-        setCodeResult('等待读取最近 30 秒验证码。');
+        setCodeResult('读取后显示最近 30 秒内的验证码。');
         statusBox.textContent = '等待输入账号信息。';
       }});
       resultRows.addEventListener('click', (event) => {{
