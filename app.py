@@ -1353,8 +1353,8 @@ def sms_form_html(
         <p id="status" class="note">等待输入账号信息。</p>
 
         <section class="realtime-panel">
-          <h2>实时验证码</h2>
-          <div id="codeResult" class="code-result">读取后显示最近 30 秒内的验证码。</div>
+          <h2>30秒实时验证码</h2>
+          <div id="codeResult" class="code-result">只显示最近 30 秒内收到的验证码。</div>
         </section>
       </aside>
 
@@ -1499,20 +1499,6 @@ def sms_form_html(
         codeResult.className = `code-result ${{type}}`.trim();
       }}
 
-      function renderCodeResult(code, subject, ageText, label) {{
-        setCodeResult(
-          `${{escapeHtml(label)}}<span class="code-big">${{escapeHtml(code)}}</span><span class="small">${{escapeHtml(ageText || '')}} ${{escapeHtml(subject || '')}}</span>`,
-          'ok'
-        );
-      }}
-
-      function showCodeFromRows(fallbackMessage = '') {{
-        const row = lastRows.find((item) => item && item.code);
-        if (!row) return false;
-        renderCodeResult(row.code, row.subject || '', fallbackMessage || '来自邮件列表', '邮件验证码');
-        return true;
-      }}
-
       async function postForm(path, data) {{
         const body = new URLSearchParams();
         Object.entries(data).forEach(([key, value]) => body.append(key, value));
@@ -1568,9 +1554,6 @@ def sms_form_html(
             </tr>
           `;
         }}).join('');
-        if (!codeResult.classList.contains('ok')) {{
-          showCodeFromRows('来自邮件列表，可能超过实时窗口');
-        }}
       }}
 
       async function fetchMail() {{
@@ -1646,16 +1629,12 @@ def sms_form_html(
           }});
           if (data.ok) {{
             const age = Number.isFinite(Number(data.age_seconds)) ? `${{data.age_seconds}} 秒前` : '';
-            setCodeResult(`最新验证码<span class="code-big">${{escapeHtml(data.code)}}</span><span class="small">${{escapeHtml(age)}} ${{escapeHtml(data.subject || '')}}</span>`, 'ok');
+            setCodeResult(`实时验证码<span class="code-big">${{escapeHtml(data.code)}}</span><span class="small">${{escapeHtml(age)}} ${{escapeHtml(data.subject || '')}}</span>`, 'ok');
           }} else {{
-            if (!showCodeFromRows('来自邮件列表，可能超过实时窗口')) {{
-              setCodeResult(escapeHtml(data.message || '未找到验证码。'), 'err');
-            }}
+            setCodeResult(escapeHtml(data.message || '30秒内未找到验证码。'), 'err');
           }}
         }} catch (error) {{
-          if (!showCodeFromRows('来自邮件列表，实时接口未命中')) {{
-            setCodeResult(escapeHtml(error.message || '读取失败。'), 'err');
-          }}
+          setCodeResult(escapeHtml(error.message || '读取失败。'), 'err');
         }} finally {{
           setLoading(false, '');
         }}
@@ -1681,7 +1660,7 @@ def sms_form_html(
         resultRows.innerHTML = '<tr><td colspan="5" class="small">还没有读取结果。</td></tr>';
         mailCount.textContent = '0 封';
         clearPreview();
-        setCodeResult('读取后显示最近 30 秒内的验证码。');
+        setCodeResult('只显示最近 30 秒内收到的验证码。');
         statusBox.textContent = '等待输入账号信息。';
       }});
       resultRows.addEventListener('click', (event) => {{
