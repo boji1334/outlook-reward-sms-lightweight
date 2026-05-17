@@ -1440,7 +1440,7 @@ def sms_form_html(
       .preview-head{{border-bottom:1px solid #eef2f7;margin-bottom:12px;padding-bottom:12px}}
       .preview-head h2{{margin-bottom:6px}}
       #mailFrame{{box-sizing:border-box;width:100%;height:calc(100vh - 150px);min-height:560px;border:1px solid #dfe5ef;border-radius:8px;background:#fff}}
-      @media(max-width:1560px){{.sms-lite{{grid-template-columns:300px minmax(0,1fr)}}.preview-panel{{grid-column:1 / -1;position:static}}.mail-list{{max-height:520px}}#mailFrame{{height:680px}}}}
+      @media(max-width:1560px){{.sms-lite{{grid-template-columns:300px minmax(0,1fr)}}.account-panel{{position:static}}.preview-panel{{grid-column:1 / -1;position:static}}.mail-list{{max-height:520px}}#mailFrame{{height:680px}}}}
       @media(max-width:980px){{.sms-lite{{grid-template-columns:1fr}}.account-panel,.preview-panel{{position:static}}.mail-list{{max-height:520px}}}}
       @media(max-width:760px){{.wrap{{padding:8px}}.account-panel,.mail-panel,.preview-panel{{padding:14px}}.mail-list{{max-height:none}}#mailFrame{{height:520px;min-height:420px}}}}
     </style>
